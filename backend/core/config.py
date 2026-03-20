@@ -1,0 +1,29 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    app_name: str = "TV Script Recommender"
+    debug: bool = False
+
+    # Database
+    database_url: str = "sqlite:///./tvscripts.db"
+
+    # ChromaDB
+    chroma_collection: str = "tv_scripts"
+    chroma_persist_dir: str = "./chroma_data"
+
+    # Embedding model
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_dim: int = 384
+
+    # LLM for feature extraction (configurable)
+    llm_provider: str = "anthropic"
+    llm_model: str = "claude-sonnet-4-20250514"
+
+    # API keys loaded from env
+    anthropic_api_key: str = ""
+
+    model_config = {"env_file": ".env", "env_prefix": "TVR_"}
+
+
+settings = Settings()
