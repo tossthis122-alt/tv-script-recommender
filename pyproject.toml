@@ -21,6 +21,9 @@ dev = [
     "ruff>=0.8",
 ]
 
+[tool.setuptools.packages.find]
+include = ["backend*", "scripts*"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120

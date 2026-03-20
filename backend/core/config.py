@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     llm_provider: str = "anthropic"
     llm_model: str = "claude-sonnet-4-20250514"
 
+    # OpenSubtitles
+    opensubtitles_api_key: str = ""
+    opensubtitles_username: str = ""
+    opensubtitles_password: str = ""
+
     # API keys loaded from env
     anthropic_api_key: str = ""
 
