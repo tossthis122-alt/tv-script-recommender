@@ -2,34 +2,28 @@
 """CLI tool for ingesting TV show subtitles from OpenSubtitles.
 
 Usage:
-    # Search and download subtitles for a show
     python -m scripts.ingest_show "Breaking Bad"
-
-    # Specify season
     python -m scripts.ingest_show "Breaking Bad" --season 1
-
-    # Use IMDB ID for precise matching
     python -m scripts.ingest_show "Breaking Bad" --imdb-id 903747
-
-    # Just search (no download/processing)
     python -m scripts.ingest_show "Breaking Bad" --search-only
+    python -m scripts.ingest_show "Breaking Bad" --skip-llm
 """
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend.pipeline.subtitles import OpenSubtitlesClient
-from backend.pipeline.srt_parser import extract_dialogue
-from backend.pipeline.ingest import chunk_script
-from backend.pipeline.extract import EXTRACTION_PROMPT, parse_features_response
+from backend.db.show_store import init_db, upsert_show as upsert_show_metadata
+from backend.db.vector_store import upsert_show as upsert_show_vector
+from backend.models.schemas import ShowInfo
 from backend.pipeline.embed import embed_text, features_to_text
-from backend.db.vector_store import upsert_show
+from backend.pipeline.extract import extract_and_merge_features
+from backend.pipeline.ingest import chunk_script
+from backend.pipeline.srt_parser import extract_dialogue
+from backend.pipeline.subtitles import OpenSubtitlesClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,7 +35,6 @@ def search_show(client: OpenSubtitlesClient, query: str, **kwargs) -> list[dict]
     """Search for a show and return deduplicated episode results."""
     results = client.search_all_episodes(query, **kwargs)
 
-    # Deduplicate: keep best subtitle per episode (highest download count)
     episodes: dict[str, dict] = {}
     for item in results:
         attrs = item.get("attributes", {})
@@ -61,6 +54,7 @@ def search_show(client: OpenSubtitlesClient, query: str, **kwargs) -> list[dict]
                 "file_id": file_id,
                 "download_count": download_count,
                 "parent_title": details.get("parent_title", query),
+                "year": details.get("year"),
             }
 
     return sorted(episodes.values(), key=lambda e: (e["season"], e["episode"]))
@@ -94,9 +88,13 @@ def download_and_save(client: OpenSubtitlesClient, show_name: str, episodes: lis
     return saved
 
 
-def process_show(show_name: str, srt_paths: list[Path], skip_llm: bool = False) -> None:
+def process_show(
+    show_name: str,
+    srt_paths: list[Path],
+    skip_llm: bool = False,
+    year: int | None = None,
+) -> None:
     """Process downloaded subtitles: parse, extract features, embed, store."""
-    # Combine all episode dialogue into one corpus per show
     all_dialogue = []
     for path in srt_paths:
         srt_content = path.read_text(encoding="utf-8", errors="replace")
@@ -111,63 +109,54 @@ def process_show(show_name: str, srt_paths: list[Path], skip_llm: bool = False) 
     combined = "\n\n".join(all_dialogue)
     logger.info(f"Extracted {len(combined):,} chars of dialogue from {len(srt_paths)} episodes")
 
+    show_id = show_name.lower().replace(" ", "_")
+
     if skip_llm:
         logger.info("Skipping LLM feature extraction (--skip-llm)")
-        # Save raw dialogue for later processing
-        output_path = DATA_DIR / show_name.lower().replace(" ", "_") / "dialogue.txt"
+        output_path = DATA_DIR / show_id / "dialogue.txt"
         output_path.write_text(combined, encoding="utf-8")
         logger.info(f"Saved raw dialogue to {output_path}")
         return
 
-    # Chunk and extract features via LLM
+    # Chunk and extract features
     chunks = chunk_script(combined)
     logger.info(f"Split into {len(chunks)} chunks for analysis")
 
-    # For now, use the first few chunks (representative sample)
-    sample_chunks = chunks[:3]
-    sample_text = "\n---\n".join(sample_chunks)
+    features = extract_and_merge_features(chunks, show_name)
+    logger.info(f"Extracted features: {features.style_summary}")
 
-    try:
-        import anthropic
-        from backend.core.config import settings
+    # Generate embedding from features
+    features_dict = features.model_dump(exclude={"show_title", "season", "episode"})
+    text_repr = features_to_text(features_dict)
+    embedding = embed_text(text_repr)
 
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-        prompt = EXTRACTION_PROMPT.format(script_text=sample_text)
+    # Store in vector DB
+    vector_metadata = {
+        "title": show_name,
+        "num_episodes": len(srt_paths),
+        "style_summary": features.style_summary,
+        "themes": ",".join(features.themes),
+        "tone": ",".join(features.tone),
+        "genre": ",".join(features.genre_blend),
+    }
+    upsert_show_vector(show_id, embedding, vector_metadata)
+    logger.info(f"Stored {show_name} in vector database")
 
-        message = client.messages.create(
-            model=settings.llm_model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        response_text = message.content[0].text
-        features = parse_features_response(response_text, show_name)
-        logger.info(f"Extracted features: {features.style_summary}")
+    # Store in SQLite catalog
+    init_db()
+    show_info = ShowInfo(
+        id=show_id,
+        title=show_name,
+        year=year,
+        num_episodes_analyzed=len(srt_paths),
+        features=features,
+    )
+    upsert_show_metadata(show_info)
+    logger.info(f"Stored {show_name} in show catalog")
 
-        # Generate embedding
-        features_dict = features.model_dump(exclude={"show_title", "season", "episode"})
-        text_repr = features_to_text(features_dict)
-        embedding = embed_text(text_repr)
-
-        # Store in vector DB
-        metadata = {
-            "title": show_name,
-            "num_episodes": len(srt_paths),
-            "style_summary": features.style_summary,
-            "themes": ",".join(features.themes),
-            "tone": ",".join(features.tone),
-            "genre": ",".join(features.genre_blend),
-        }
-        show_id = show_name.lower().replace(" ", "_")
-        upsert_show(show_id, embedding, metadata)
-        logger.info(f"Stored {show_name} in vector database")
-
-        # Save features to disk too
-        features_path = DATA_DIR / show_id / "features.json"
-        features_path.write_text(features.model_dump_json(indent=2), encoding="utf-8")
-
-    except Exception as e:
-        logger.error(f"Feature extraction failed: {e}")
-        raise
+    # Save features to disk
+    features_path = DATA_DIR / show_id / "features.json"
+    features_path.write_text(features.model_dump_json(indent=2), encoding="utf-8")
 
 
 def main():
@@ -183,7 +172,6 @@ def main():
     with OpenSubtitlesClient() as client:
         client.login()
 
-        # Search
         search_kwargs = {}
         if args.imdb_id:
             search_kwargs["imdb_id"] = args.imdb_id
@@ -198,6 +186,7 @@ def main():
             sys.exit(1)
 
         show_name = episodes[0].get("parent_title", args.show)
+        year = episodes[0].get("year")
         logger.info(f"Found {len(episodes)} episodes for '{show_name}'")
 
         if args.search_only:
@@ -205,15 +194,12 @@ def main():
                 print(f"  {ep['key']}: {ep.get('title', '?')} (downloads: {ep['download_count']})")
             return
 
-        # Limit episodes
         episodes = episodes[: args.max_episodes]
 
-        # Download
         srt_paths = download_and_save(client, show_name, episodes)
         logger.info(f"Downloaded {len(srt_paths)} subtitle files")
 
-        # Process
-        process_show(show_name, srt_paths, skip_llm=args.skip_llm)
+        process_show(show_name, srt_paths, skip_llm=args.skip_llm, year=year)
 
     logger.info("Done!")
 
