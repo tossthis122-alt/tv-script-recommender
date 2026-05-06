@@ -24,12 +24,21 @@ class ScriptFeatures(BaseModel):
 
 
 class ShowInfo(BaseModel):
-    """Basic show metadata."""
+    """Show metadata from catalog + external sources."""
 
     id: str
     title: str
     year: int | None = None
     network: str = ""
+    genres: list[str] = []
+    overview: str = ""
+    poster_url: str = ""
+    imdb_id: str = ""
+    tmdb_id: int | None = None
+    tvdb_id: int | None = None
+    status: str = ""
+    num_seasons: int = 0
+    num_episodes: int = 0
     num_episodes_analyzed: int = 0
     features: ScriptFeatures | None = None
 

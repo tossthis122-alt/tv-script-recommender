@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     opensubtitles_username: str = ""
     opensubtitles_password: str = ""
 
+    # TMDB
+    tmdb_api_key: str = ""
+    tmdb_read_token: str = ""
+
+    # TVDB
+    tvdb_api_key: str = ""
+
     # API keys loaded from env
     anthropic_api_key: str = ""
 

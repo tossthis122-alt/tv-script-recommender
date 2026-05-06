@@ -3,6 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from backend.db import show_store
+from backend.metadata.enrich import enrich_show
 from backend.models.schemas import RecommendationRequest, RecommendationResponse, RecommendationResult, ShowInfo
 from backend.recommender.engine import recommend_blended, recommend_by_show, recommend_by_text
 
@@ -46,6 +47,44 @@ def delete_show(show_id: str):
     if not show_store.delete_show(show_id):
         raise HTTPException(status_code=404, detail="Show not found")
     return {"status": "deleted", "id": show_id}
+
+
+@router.get("/shows/{show_id}/enrich", response_model=ShowInfo)
+def enrich_show_metadata(show_id: str):
+    """Enrich an existing show with metadata from TMDB/TVDB."""
+    show = show_store.get_show(show_id)
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found")
+
+    metadata = enrich_show(show.title, year=show.year, imdb_id=show.imdb_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="No metadata found from external sources")
+
+    enriched = show.model_copy(update={
+        "network": metadata.get("network") or show.network,
+        "genres": metadata.get("genres") or show.genres,
+        "overview": metadata.get("overview") or show.overview,
+        "poster_url": metadata.get("poster_url") or show.poster_url,
+        "imdb_id": metadata.get("imdb_id") or show.imdb_id,
+        "tmdb_id": metadata.get("tmdb_id") or show.tmdb_id,
+        "tvdb_id": metadata.get("tvdb_id") or show.tvdb_id,
+        "status": metadata.get("status") or show.status,
+        "num_seasons": metadata.get("num_seasons") or show.num_seasons,
+        "num_episodes": metadata.get("num_episodes") or show.num_episodes,
+    })
+    show_store.upsert_show(enriched)
+    return enriched
+
+
+@router.get("/lookup")
+def lookup_show(q: str):
+    """Look up show metadata from TMDB/TVDB without adding to catalog."""
+    if len(q) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+    metadata = enrich_show(q)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="No results found")
+    return metadata
 
 
 # --- Recommendations ---

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.db.show_store import init_db, upsert_show as upsert_show_metadata
 from backend.db.vector_store import upsert_show as upsert_show_vector
+from backend.metadata.enrich import enrich_show
 from backend.models.schemas import ShowInfo
 from backend.pipeline.embed import embed_text, features_to_text
 from backend.pipeline.extract import extract_and_merge_features
@@ -55,6 +56,7 @@ def search_show(client: OpenSubtitlesClient, query: str, **kwargs) -> list[dict]
                 "download_count": download_count,
                 "parent_title": details.get("parent_title", query),
                 "year": details.get("year"),
+                "imdb_id": details.get("imdb_id"),
             }
 
     return sorted(episodes.values(), key=lambda e: (e["season"], e["episode"]))
@@ -93,6 +95,7 @@ def process_show(
     srt_paths: list[Path],
     skip_llm: bool = False,
     year: int | None = None,
+    imdb_id: str = "",
 ) -> None:
     """Process downloaded subtitles: parse, extract features, embed, store."""
     all_dialogue = []
@@ -111,11 +114,35 @@ def process_show(
 
     show_id = show_name.lower().replace(" ", "_")
 
+    # Enrich with metadata from TMDB/TVDB
+    logger.info(f"Looking up metadata for '{show_name}'...")
+    metadata = enrich_show(show_name, year=year, imdb_id=imdb_id) or {}
+
     if skip_llm:
         logger.info("Skipping LLM feature extraction (--skip-llm)")
         output_path = DATA_DIR / show_id / "dialogue.txt"
         output_path.write_text(combined, encoding="utf-8")
         logger.info(f"Saved raw dialogue to {output_path}")
+
+        # Still save metadata even without LLM
+        init_db()
+        show_info = ShowInfo(
+            id=show_id,
+            title=metadata.get("title", show_name),
+            year=metadata.get("year", year),
+            network=metadata.get("network", ""),
+            genres=metadata.get("genres", []),
+            overview=metadata.get("overview", ""),
+            poster_url=metadata.get("poster_url", ""),
+            imdb_id=metadata.get("imdb_id", imdb_id),
+            tmdb_id=metadata.get("tmdb_id"),
+            tvdb_id=metadata.get("tvdb_id"),
+            status=metadata.get("status", ""),
+            num_seasons=metadata.get("num_seasons", 0),
+            num_episodes=metadata.get("num_episodes", 0),
+            num_episodes_analyzed=len(srt_paths),
+        )
+        upsert_show_metadata(show_info)
         return
 
     # Chunk and extract features
@@ -132,7 +159,7 @@ def process_show(
 
     # Store in vector DB
     vector_metadata = {
-        "title": show_name,
+        "title": metadata.get("title", show_name),
         "num_episodes": len(srt_paths),
         "style_summary": features.style_summary,
         "themes": ",".join(features.themes),
@@ -142,12 +169,22 @@ def process_show(
     upsert_show_vector(show_id, embedding, vector_metadata)
     logger.info(f"Stored {show_name} in vector database")
 
-    # Store in SQLite catalog
+    # Store in SQLite catalog with enriched metadata
     init_db()
     show_info = ShowInfo(
         id=show_id,
-        title=show_name,
-        year=year,
+        title=metadata.get("title", show_name),
+        year=metadata.get("year", year),
+        network=metadata.get("network", ""),
+        genres=metadata.get("genres", []),
+        overview=metadata.get("overview", ""),
+        poster_url=metadata.get("poster_url", ""),
+        imdb_id=metadata.get("imdb_id", imdb_id),
+        tmdb_id=metadata.get("tmdb_id"),
+        tvdb_id=metadata.get("tvdb_id"),
+        status=metadata.get("status", ""),
+        num_seasons=metadata.get("num_seasons", 0),
+        num_episodes=metadata.get("num_episodes", 0),
         num_episodes_analyzed=len(srt_paths),
         features=features,
     )
@@ -187,6 +224,8 @@ def main():
 
         show_name = episodes[0].get("parent_title", args.show)
         year = episodes[0].get("year")
+        imdb_id_raw = episodes[0].get("imdb_id")
+        imdb_id = f"tt{imdb_id_raw}" if imdb_id_raw and not str(imdb_id_raw).startswith("tt") else str(imdb_id_raw or "")
         logger.info(f"Found {len(episodes)} episodes for '{show_name}'")
 
         if args.search_only:
@@ -199,7 +238,7 @@ def main():
         srt_paths = download_and_save(client, show_name, episodes)
         logger.info(f"Downloaded {len(srt_paths)} subtitle files")
 
-        process_show(show_name, srt_paths, skip_llm=args.skip_llm, year=year)
+        process_show(show_name, srt_paths, skip_llm=args.skip_llm, year=year, imdb_id=imdb_id)
 
     logger.info("Done!")
 
